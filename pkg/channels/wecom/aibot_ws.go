@@ -2,8 +2,15 @@ package wecom
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +21,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/identity"
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
@@ -32,6 +40,13 @@ const (
 	// wsStreamMaxDuration is a safety margin below the 6-minute hard limit.
 	wsStreamTickInterval = 30 * time.Second
 	wsStreamMaxDuration  = 5*time.Minute + 30*time.Second
+
+	// wsImageDownloadTimeout caps the time we spend downloading an inbound image.
+	wsImageDownloadTimeout = 30 * time.Second
+
+	// wsMediaWaitTimeout is how long the goroutine waits for images (delivered via
+	// SendMedia → mediaCh) AFTER sending the text finish frame, before giving up.
+	wsMediaWaitTimeout = 500 * time.Millisecond
 )
 
 // WeComAIBotWSChannel implements channels.Channel for WeCom AI Bot using the
@@ -58,6 +73,23 @@ type WeComAIBotWSChannel struct {
 	// Used only for subscribe/ping command-response pairs.
 	reqPending   map[string]chan wsEnvelope
 	reqPendingMu sync.Mutex
+
+	// lastReqIDs records the most recent req_id per chat so that SendMedia can
+	// send images even after the stream has finished.
+	lastReqIDs   map[string]wsReqIDRecord
+	lastReqIDsMu sync.Mutex
+
+	// tasksByMsgID allows Send() to route a response to the exact task that
+	// originated from a given inbound message ID, even if a newer task has
+	// since replaced it in the tasks map (concurrent-message race prevention).
+	// Protected by tasksMu.
+	tasksByMsgID map[string]*wsTask
+}
+
+// wsReqIDRecord stores a req_id and its expiry time.
+type wsReqIDRecord struct {
+	ReqID     string
+	ExpiresAt time.Time
 }
 
 // wsTask tracks one in-progress agent reply for a single chat turn.
@@ -66,7 +98,8 @@ type wsTask struct {
 	ChatID      string
 	StreamID    string // our generated stream.id
 	CreatedTime time.Time
-	answerCh    chan string // agent delivers its reply here via Send()
+	answerCh    chan string          // agent delivers its reply here via Send()
+	mediaCh     chan []bus.MediaPart // agent's media attachments (buffered: 1)
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -99,12 +132,19 @@ type wsRespondMsgBody struct {
 	Stream   *wsStreamContent   `json:"stream,omitempty"`
 	Text     *wsTextContent     `json:"text,omitempty"`
 	Markdown *wsMarkdownContent `json:"markdown,omitempty"`
+	Image    *wsImageContent    `json:"image,omitempty"`
 }
 
 type wsStreamContent struct {
 	ID      string `json:"id"`
 	Finish  bool   `json:"finish"`
 	Content string `json:"content,omitempty"`
+}
+
+// wsImageContent carries a base64-encoded image payload for outbound messages.
+type wsImageContent struct {
+	Base64 string `json:"base64"`
+	MD5    string `json:"md5"`
 }
 
 type wsTextContent struct {
@@ -173,10 +213,12 @@ func newWeComAIBotWSChannel(
 	)
 
 	return &WeComAIBotWSChannel{
-		BaseChannel: base,
-		config:      cfg,
-		tasks:       make(map[string]*wsTask),
-		reqPending:  make(map[string]chan wsEnvelope),
+		BaseChannel:  base,
+		config:       cfg,
+		tasks:        make(map[string]*wsTask),
+		tasksByMsgID: make(map[string]*wsTask),
+		reqPending:   make(map[string]chan wsEnvelope),
+		lastReqIDs:   make(map[string]wsReqIDRecord),
 	}, nil
 }
 
@@ -220,21 +262,78 @@ func (c *WeComAIBotWSChannel) Send(ctx context.Context, msg bus.OutboundMessage)
 	}
 
 	c.tasksMu.Lock()
-	task := c.tasks[msg.ChatID]
+	var task *wsTask
+	// Prefer exact per-message routing to avoid stale responses going to the
+	// wrong (newer) task when two messages arrive in rapid succession.
+	if msg.MessageID != "" {
+		task = c.tasksByMsgID[msg.MessageID]
+	}
+	if task == nil {
+		task = c.tasks[msg.ChatID]
+	}
 	c.tasksMu.Unlock()
 
 	if task == nil {
 		logger.DebugCF("wecom_aibot", "Send: no active task for chat (may have finished or timed out)",
-			map[string]any{"chat_id": msg.ChatID})
+			map[string]any{"chat_id": msg.ChatID, "message_id": msg.MessageID})
 		return nil
 	}
 
+	// Non-blocking fast path: when answerCh has space, deliver without racing
+	// against task.ctx.Done() (which fires when the task is canceled by a new
+	// incoming message, but the response must still be sent).
+	select {
+	case task.answerCh <- msg.Content:
+		return nil
+	default:
+	}
+	// answerCh was full; block with cancellation guards.
 	select {
 	case task.answerCh <- msg.Content:
 	case <-task.ctx.Done():
-		return nil // task canceled (connection dropped)
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	return nil
+}
+
+// SendMedia implements channels.MediaSender.
+// if there is an active task for this chat, media is sent to the task's mediaCh and will be delivered after the text reply.
+func (c *WeComAIBotWSChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) error {
+	if !c.IsRunning() {
+		return channels.ErrNotRunning
+	}
+	c.tasksMu.Lock()
+	task := c.tasks[msg.ChatID]
+	c.tasksMu.Unlock()
+	logger.InfoCF("wecom_aibot", "SendMedia called",
+		map[string]any{"chat_id": msg.ChatID, "parts": len(msg.Parts), "has_task": task != nil})
+	if task != nil {
+		select {
+		case task.mediaCh <- msg.Parts:
+			return nil
+		case <-task.ctx.Done():
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			logger.DebugCF("wecom_aibot", "SendMedia: mediaCh full or task done", map[string]any{"chat_id": msg.ChatID})
+		}
+	}
+	reqID := c.getLastReqID(msg.ChatID)
+	if reqID == "" {
+		logger.WarnCF("wecom_aibot", "SendMedia: no active req_id for chat, dropping media",
+			map[string]any{"chat_id": msg.ChatID})
+		return nil
+	}
+	store := c.GetMediaStore()
+	if store == nil {
+		return nil
+	}
+	for _, part := range msg.Parts {
+		if part.Type == "image" {
+			c.sendWSStandaloneImage(reqID, part, store)
+		}
 	}
 	return nil
 }
@@ -547,7 +646,101 @@ func (c *WeComAIBotWSChannel) handleWSTextMessage(reqID string, msg WeComAIBotWS
 		logger.ErrorC("wecom_aibot", "text message missing text field")
 		return
 	}
+	c.dispatchWSAgentTask(reqID, msg, msg.Text.Content, nil)
+}
 
+// handleWSImageMessage downloads and stores the inbound image, then dispatches
+// it to the agent as a media-tagged message.
+func (c *WeComAIBotWSChannel) handleWSImageMessage(reqID string, msg WeComAIBotWSMessage) {
+	if msg.Image == nil {
+		logger.WarnC("wecom_aibot", "Image message missing image field")
+		c.wsSendStreamFinish(reqID, wsGenerateID(), "Image message could not be processed.")
+		return
+	}
+
+	chatID := msg.ChatID
+	if chatID == "" {
+		chatID = msg.From.UserID
+	}
+
+	ctx, cancel := context.WithTimeout(c.ctx, wsImageDownloadTimeout)
+	defer cancel()
+
+	var mediaRefs []string
+	ref, err := c.storeWSImage(ctx, chatID, msg.MsgID, msg.Image.URL, msg.Image.AESKey)
+	if err != nil {
+		logger.WarnCF("wecom_aibot", "Failed to download/store WS image",
+			map[string]any{"error": err, "url": msg.Image.URL})
+	} else {
+		mediaRefs = append(mediaRefs, ref)
+	}
+
+	c.dispatchWSAgentTask(reqID, msg, "[image]", mediaRefs)
+}
+
+// handleWSMixedMessage handles mixed text+image messages.
+// All text parts are collected into the content string; all image parts are
+// downloaded and stored in MediaStore before dispatching to the agent.
+func (c *WeComAIBotWSChannel) handleWSMixedMessage(reqID string, msg WeComAIBotWSMessage) {
+	if msg.Mixed == nil {
+		logger.WarnC("wecom_aibot", "Mixed message has no content")
+		c.wsSendStreamFinish(reqID, wsGenerateID(), "Mixed message type is not yet fully supported.")
+		return
+	}
+
+	chatID := msg.ChatID
+	if chatID == "" {
+		chatID = msg.From.UserID
+	}
+
+	ctx, cancel := context.WithTimeout(c.ctx, wsImageDownloadTimeout)
+	defer cancel()
+
+	var textParts []string
+	var mediaRefs []string
+	for _, item := range msg.Mixed.MsgItem {
+		switch item.MsgType {
+		case "text":
+			if item.Text != nil && item.Text.Content != "" {
+				textParts = append(textParts, item.Text.Content)
+			}
+		case "image":
+			if item.Image != nil {
+				ref, err := c.storeWSImage(ctx, chatID,
+					msg.MsgID+"-"+wsGenerateID(), item.Image.URL, item.Image.AESKey)
+				if err != nil {
+					logger.WarnCF("wecom_aibot", "Failed to download/store mixed image",
+						map[string]any{"error": err})
+				} else {
+					mediaRefs = append(mediaRefs, ref)
+				}
+			}
+		}
+	}
+
+	if len(textParts) == 0 && len(mediaRefs) == 0 {
+		logger.WarnC("wecom_aibot", "Mixed message has no usable content")
+		c.wsSendStreamFinish(reqID, wsGenerateID(), "Mixed message type is not yet fully supported.")
+		return
+	}
+
+	content := strings.Join(textParts, "\n")
+	if content == "" {
+		content = "[images]"
+	}
+	c.dispatchWSAgentTask(reqID, msg, content, mediaRefs)
+}
+
+// dispatchWSAgentTask registers a new agent task, sends the opening stream frame,
+// and starts a goroutine that runs the agent and streams the reply back.
+// content is the text forwarded to the agent; mediaRefs are optional media
+// store references attached to the inbound message.
+func (c *WeComAIBotWSChannel) dispatchWSAgentTask(
+	reqID string,
+	msg WeComAIBotWSMessage,
+	content string,
+	mediaRefs []string,
+) {
 	userID := msg.From.UserID
 	if userID == "" {
 		userID = "unknown"
@@ -566,6 +759,7 @@ func (c *WeComAIBotWSChannel) handleWSTextMessage(reqID string, msg WeComAIBotWS
 		StreamID:    streamID,
 		CreatedTime: time.Now(),
 		answerCh:    make(chan string, 1),
+		mediaCh:     make(chan []bus.MediaPart, 1),
 		ctx:         taskCtx,
 		cancel:      taskCancel,
 	}
@@ -576,10 +770,16 @@ func (c *WeComAIBotWSChannel) handleWSTextMessage(reqID string, msg WeComAIBotWS
 		prev.cancel()
 	}
 	c.tasks[chatID] = task
+	// Also register by inbound message ID for precise response routing.
+	if msg.MsgID != "" {
+		c.tasksByMsgID[msg.MsgID] = task
+	}
 	c.tasksMu.Unlock()
 
-	// Send an empty stream opening frame (finish=false) immediately so WeCom
-	// shows the typing indicator while the agent is processing.
+	// Record this reqID so SendMedia can route images even after the stream closes.
+	c.recordLastReqID(chatID, reqID)
+
+	// Send an empty stream opening frame (finish=false) immediately.
 	c.wsSendStreamChunk(reqID, streamID, false, "")
 
 	go func() {
@@ -588,6 +788,9 @@ func (c *WeComAIBotWSChannel) handleWSTextMessage(reqID string, msg WeComAIBotWS
 			c.tasksMu.Lock()
 			if c.tasks[chatID] == task {
 				delete(c.tasks, chatID)
+			}
+			if msg.MsgID != "" && c.tasksByMsgID[msg.MsgID] == task {
+				delete(c.tasksByMsgID, msg.MsgID)
 			}
 			c.tasksMu.Unlock()
 		}()
@@ -606,14 +809,13 @@ func (c *WeComAIBotWSChannel) handleWSTextMessage(reqID string, msg WeComAIBotWS
 		metadata := map[string]string{
 			"channel":   "wecom_aibot",
 			"chat_type": msg.ChatType,
-			"msg_type":  "text",
+			"msg_type":  msg.MsgType,
 			"msgid":     msg.MsgID,
 			"aibotid":   msg.AIBotID,
 			"stream_id": streamID,
 		}
-		// PublishInbound is non-blocking; the agent will call Send() when done.
 		c.HandleMessage(taskCtx, peer, msg.MsgID, userID, chatID,
-			msg.Text.Content, nil, metadata, sender)
+			content, mediaRefs, metadata, sender)
 
 		// Wait for the agent reply. While waiting, send periodic finish=false
 		// hints so the user knows processing is still in progress.
@@ -632,70 +834,52 @@ func (c *WeComAIBotWSChannel) handleWSTextMessage(reqID string, msg WeComAIBotWS
 		for {
 			select {
 			case answer := <-task.answerCh:
-				// Agent replied — deliver the real answer as the final frame.
+				// 1. send final frame with finish=true; any media will come in subsequent frames (if at all)
 				c.wsSendStreamFinish(reqID, streamID, answer)
+				// 2. wait briefly for any media to arrive via SendMedia → mediaCh,
+				// and send each image in its own frame (WeCom does not support multiple images in one frame,
+				// and the agent may have sent them at different times)
+				var mediaParts []bus.MediaPart
+				select {
+				case mediaParts = <-task.mediaCh:
+					logger.InfoCF("wecom_aibot", "Sending queued media images",
+						map[string]any{"chat_id": chatID, "count": len(mediaParts)})
+				case <-time.After(wsMediaWaitTimeout):
+				}
+				if store := c.GetMediaStore(); store != nil {
+					for _, part := range mediaParts {
+						if part.Type == "image" {
+							c.sendWSStandaloneImage(reqID, part, store)
+						}
+					}
+				}
 				return
 			case <-ticker.C:
-				// Send an in-progress hint (finish=false). WeCom replaces the
-				// displayed content with the latest non-finish frame, so the
-				// user just sees the most recent hint, not an accumulation.
 				hint := waitHints[tickCount%len(waitHints)]
 				tickCount++
 				logger.DebugCF("wecom_aibot", "Sending stream progress hint",
 					map[string]any{"chat_id": chatID, "tick": tickCount})
 				c.wsSendStreamChunk(reqID, streamID, false, hint)
 			case <-deadlineTimer.C:
-				// Hard deadline reached before the agent replied. Close the
-				// stream with a timeout notice (still within the 6-minute window).
 				logger.WarnCF("wecom_aibot", "Stream deadline reached without agent reply",
 					map[string]any{"chat_id": chatID, "stream_id": streamID})
 				c.wsSendStreamFinish(reqID, streamID,
 					"⏳ Processing is taking longer than expected. Please resend your message to try again.")
 				return
 			case <-taskCtx.Done():
-				// Connection dropped or task canceled; nothing to send.
+				// Give a short grace period so that a response queued in the bus
+				// just before cancellation can still be delivered.  This closes a
+				// race where a rapid second message cancels this task after the
+				// agent already published but before Send() wrote to answerCh.
+				select {
+				case answer := <-task.answerCh:
+					c.wsSendStreamFinish(reqID, streamID, answer)
+				case <-time.After(100 * time.Millisecond):
+				}
 				return
 			}
 		}
 	}()
-}
-
-// handleWSImageMessage handles image messages.
-func (c *WeComAIBotWSChannel) handleWSImageMessage(reqID string, msg WeComAIBotWSMessage) {
-	logger.WarnC("wecom_aibot", "Image messages not yet supported in WebSocket mode")
-	content := "Image messages are not yet supported."
-	if msg.Image != nil {
-		content = fmt.Sprintf(
-			"Image received (URL: %s), but image messages are not yet supported.",
-			msg.Image.URL,
-		)
-	}
-	c.wsSendStreamFinish(reqID, wsGenerateID(), content)
-}
-
-// handleWSMixedMessage handles mixed text+image messages.
-// If the message contains a text part it is handled as a text message;
-// otherwise an unsupported-type notice is returned.
-func (c *WeComAIBotWSChannel) handleWSMixedMessage(reqID string, msg WeComAIBotWSMessage) {
-	if msg.Mixed != nil {
-		for _, item := range msg.Mixed.MsgItem {
-			if item.MsgType == "text" && item.Text != nil {
-				// Treat the text portion as a standalone text message.
-				c.handleWSTextMessage(reqID, WeComAIBotWSMessage{
-					MsgID:    msg.MsgID,
-					AIBotID:  msg.AIBotID,
-					ChatID:   msg.ChatID,
-					ChatType: msg.ChatType,
-					From:     msg.From,
-					MsgType:  "text",
-					Text:     item.Text,
-				})
-				return
-			}
-		}
-	}
-	logger.WarnC("wecom_aibot", "Mixed message has no usable text part")
-	c.wsSendStreamFinish(reqID, wsGenerateID(), "Mixed message type is not yet fully supported.")
 }
 
 // handleWSVoiceMessage handles voice messages.
@@ -742,7 +926,7 @@ func (c *WeComAIBotWSChannel) wsSendStreamChunk(reqID, streamID string, finish b
 	})
 }
 
-// wsSendStreamFinish sends the final aibot_respond_msg frame (finish=true).
+// wsSendStreamFinish sends the final aibot_respond_msg frame (finish=true, no images).
 func (c *WeComAIBotWSChannel) wsSendStreamFinish(reqID, streamID, content string) {
 	c.wsSendStreamChunk(reqID, streamID, true, content)
 }
@@ -798,4 +982,137 @@ func (c *WeComAIBotWSChannel) cancelAllTasks() {
 // It is package-level (not a method) so it can be shared by both channel modes.
 func wsGenerateID() string {
 	return generateRandomID(10)
+}
+
+// ---- req_id tracking (for SendMedia after stream close) ----
+
+// recordLastReqID stores the req_id for chatID with a TTL slightly beyond the
+// stream max duration so that SendMedia can find it after finish=true is sent.
+func (c *WeComAIBotWSChannel) recordLastReqID(chatID, reqID string) {
+	c.lastReqIDsMu.Lock()
+	c.lastReqIDs[chatID] = wsReqIDRecord{
+		ReqID:     reqID,
+		ExpiresAt: time.Now().Add(wsStreamMaxDuration + 2*time.Minute),
+	}
+	c.lastReqIDsMu.Unlock()
+}
+
+// getLastReqID returns the most recent req_id for chatID, or "" if none/expired.
+func (c *WeComAIBotWSChannel) getLastReqID(chatID string) string {
+	c.lastReqIDsMu.Lock()
+	r, ok := c.lastReqIDs[chatID]
+	c.lastReqIDsMu.Unlock()
+	if !ok || time.Now().After(r.ExpiresAt) {
+		return ""
+	}
+	return r.ReqID
+}
+
+// ---- Image send helpers ----
+
+// sendWSStandaloneImage reads a media part from store and sends it as a
+// standalone aibot_respond_msg with msgtype "image".
+func (c *WeComAIBotWSChannel) sendWSStandaloneImage(reqID string, part bus.MediaPart, store media.MediaStore) {
+	localPath, err := store.Resolve(part.Ref)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "SendMedia: resolve failed", map[string]any{"ref": part.Ref, "error": err})
+		return
+	}
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		logger.ErrorCF("wecom_aibot", "SendMedia: read file failed", map[string]any{"path": localPath, "error": err})
+		return
+	}
+	hash := md5.Sum(data)
+	logger.InfoCF("wecom_aibot", "Sending standalone image",
+		map[string]any{"req_id": reqID, "path": localPath, "bytes": len(data)})
+	c.writeWS(wsCommand{
+		Cmd:     "aibot_respond_msg",
+		Headers: wsHeaders{ReqID: reqID},
+		Body: wsRespondMsgBody{
+			MsgType: "image",
+			Image: &wsImageContent{
+				Base64: base64.StdEncoding.EncodeToString(data),
+				MD5:    fmt.Sprintf("%x", hash),
+			},
+		},
+	})
+}
+
+// ---- Inbound image download helpers ----
+
+// downloadWSImage fetches and optionally decrypts a WeCom WS image resource.
+// aesKey is the per-resource AES key provided in the callback (may be empty).
+func (c *WeComAIBotWSChannel) downloadWSImage(ctx context.Context, imageURL, aesKey string) ([]byte, error) {
+	const maxSize = 20 << 20 // 20 MB
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	client := &http.Client{Timeout: wsImageDownloadTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if len(data) > maxSize {
+		return nil, fmt.Errorf("image too large (> %d MB)", maxSize>>20)
+	}
+	if aesKey == "" {
+		return data, nil
+	}
+	// WeCom per-image AES key: try standard base64 first, then WeCom 43-char format.
+	key, decErr := base64.StdEncoding.DecodeString(aesKey)
+	if decErr != nil || len(key) != 32 {
+		key, decErr = decodeWeComAESKey(aesKey)
+		if decErr != nil {
+			return nil, fmt.Errorf("decode image AES key: %w", decErr)
+		}
+	}
+	decrypted, err := decryptAESCBC(key, data)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt image: %w", err)
+	}
+	return decrypted, nil
+}
+
+// storeWSImage downloads, optionally decrypts, and stores an inbound image.
+func (c *WeComAIBotWSChannel) storeWSImage(
+	ctx context.Context,
+	chatID, msgID, imageURL, aesKey string,
+) (string, error) {
+	store := c.GetMediaStore()
+	if store == nil {
+		return "", fmt.Errorf("no media store available")
+	}
+	data, err := c.downloadWSImage(ctx, imageURL, aesKey)
+	if err != nil {
+		return "", err
+	}
+	mediaDir := filepath.Join(os.TempDir(), "picoclaw_media")
+	if mkErr := os.MkdirAll(mediaDir, 0o700); mkErr != nil {
+		return "", fmt.Errorf("mkdir: %w", mkErr)
+	}
+	filename := msgID + ".jpg"
+	localPath := filepath.Join(mediaDir, utils.SanitizeFilename(filename))
+	if writeErr := os.WriteFile(localPath, data, 0o600); writeErr != nil {
+		return "", fmt.Errorf("write: %w", writeErr)
+	}
+	scope := channels.BuildMediaScope("wecom_aibot", chatID, msgID)
+	ref, err := store.Store(localPath, media.MediaMeta{
+		Filename: filename,
+		Source:   "wecom_aibot",
+	}, scope)
+	if err != nil {
+		os.Remove(localPath)
+		return "", fmt.Errorf("store: %w", err)
+	}
+	return ref, nil
 }
