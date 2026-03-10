@@ -31,6 +31,7 @@ const (
 	wsHeartbeatInterval = 30 * time.Second
 	wsConnectTimeout    = 15 * time.Second
 	wsSubscribeTimeout  = 10 * time.Second
+	wsSendMsgTimeout    = 10 * time.Second
 	wsMaxReconnectWait  = 60 * time.Second
 	wsInitialReconnect  = time.Second
 
@@ -42,6 +43,9 @@ const (
 
 	// wsImageDownloadTimeout caps the time we spend downloading an inbound image.
 	wsImageDownloadTimeout = 30 * time.Second
+
+	// Keep req_id -> chat route for late fallback pushes after stream window closes.
+	wsLateReplyRouteTTL = 30 * time.Minute
 )
 
 // WeComAIBotWSChannel implements channels.Channel for WeCom AI Bot using the
@@ -59,11 +63,10 @@ type WeComAIBotWSChannel struct {
 	conn   *websocket.Conn
 	connMu sync.Mutex
 
-	// tasks holds one live agent task per req_id (WeCom turn identifier).
-	// Each inbound message gets a unique req_id, so concurrent messages are
-	// handled independently without canceling each other.
-	tasks   map[string]*wsTask
-	tasksMu sync.Mutex
+	// reqStates holds per-req_id runtime state.
+	// It unifies active task state and late-reply fallback routing.
+	reqStates   map[string]*wsReqState
+	reqStatesMu sync.Mutex
 
 	// reqPending correlates command req_ids with response channels.
 	// Used only for subscribe/ping command-response pairs.
@@ -75,12 +78,25 @@ type WeComAIBotWSChannel struct {
 type wsTask struct {
 	ReqID       string // req_id echoed in all replies for this turn
 	ChatID      string
+	ChatType    uint32
 	StreamID    string // our generated stream.id
 	CreatedTime time.Time
 	answerCh    chan string          // agent delivers its reply here via Send()
 	mediaCh     chan []bus.MediaPart // agent's media attachments (buffered: 1)
 	ctx         context.Context
 	cancel      context.CancelFunc
+}
+
+type wsReqState struct {
+	Task  *wsTask
+	Route wsLateReplyRoute
+}
+
+type wsLateReplyRoute struct {
+	ChatID    string
+	ChatType  uint32
+	ReadyAt   time.Time
+	ExpiresAt time.Time
 }
 
 // ---- WebSocket protocol types ----
@@ -103,6 +119,13 @@ type wsCommand struct {
 	Cmd     string    `json:"cmd"`
 	Headers wsHeaders `json:"headers"`
 	Body    any       `json:"body,omitempty"`
+}
+
+type wsSendMsgBody struct {
+	ChatID   string             `json:"chatid"`
+	ChatType uint32             `json:"chat_type,omitempty"`
+	MsgType  string             `json:"msgtype"`
+	Markdown *wsMarkdownContent `json:"markdown,omitempty"`
 }
 
 // wsRespondMsgBody is the body for aibot_respond_msg / aibot_respond_welcome_msg.
@@ -194,7 +217,7 @@ func newWeComAIBotWSChannel(
 	return &WeComAIBotWSChannel{
 		BaseChannel: base,
 		config:      cfg,
-		tasks:       make(map[string]*wsTask),
+		reqStates:   make(map[string]*wsReqState),
 		reqPending:  make(map[string]chan wsEnvelope),
 	}, nil
 }
@@ -239,13 +262,35 @@ func (c *WeComAIBotWSChannel) Send(ctx context.Context, msg bus.OutboundMessage)
 	}
 
 	// msg.ChatID carries the inbound req_id (set by dispatchWSAgentTask).
-	c.tasksMu.Lock()
-	task := c.tasks[msg.ChatID]
-	c.tasksMu.Unlock()
+	task, route, ok := c.getReqState(msg.ChatID)
+	if !ok {
+		logger.DebugCF("wecom_aibot", "Send: no active task/route for req_id (may be stale)",
+			map[string]any{"req_id": msg.ChatID})
+		return nil
+	}
 
 	if task == nil {
-		logger.DebugCF("wecom_aibot", "Send: no active task for req_id (may have finished or timed out)",
-			map[string]any{"req_id": msg.ChatID})
+		if !ok {
+			logger.DebugCF("wecom_aibot", "Send: no active task/route for req_id (may be stale)",
+				map[string]any{"req_id": msg.ChatID})
+			return nil
+		}
+		if time.Now().Before(route.ReadyAt) {
+			// Keep using aibot_respond_msg within stream window; do not proactively
+			// push unless wsStreamMaxDuration has elapsed.
+			logger.DebugCF("wecom_aibot", "Send: stream window still open, skip proactive push",
+				map[string]any{"req_id": msg.ChatID, "ready_at": route.ReadyAt.Format(time.RFC3339)})
+			return nil
+		}
+
+		if err := c.wsSendActivePush(route.ChatID, route.ChatType, msg.Content); err != nil {
+			logger.WarnCF("wecom_aibot", "Late reply proactive push failed",
+				map[string]any{"req_id": msg.ChatID, "chat_id": route.ChatID, "error": err})
+			return err
+		}
+		logger.InfoCF("wecom_aibot", "Late reply delivered via proactive push",
+			map[string]any{"req_id": msg.ChatID, "chat_id": route.ChatID, "chat_type": route.ChatType})
+		c.deleteReqState(msg.ChatID)
 		return nil
 	}
 
@@ -683,11 +728,13 @@ func (c *WeComAIBotWSChannel) dispatchWSAgentTask(
 	}
 
 	streamID := wsGenerateID()
+	chatType := wsChatTypeValue(msg.ChatType)
 	taskCtx, taskCancel := context.WithCancel(c.ctx)
 
 	task := &wsTask{
 		ReqID:       reqID,
 		ChatID:      actualChatID,
+		ChatType:    chatType,
 		StreamID:    streamID,
 		CreatedTime: time.Now(),
 		answerCh:    make(chan string, 1),
@@ -695,11 +742,16 @@ func (c *WeComAIBotWSChannel) dispatchWSAgentTask(
 		ctx:         taskCtx,
 		cancel:      taskCancel,
 	}
-
-	c.tasksMu.Lock()
 	// Each req_id is unique per WeCom turn; tasks run concurrently, no cancellation.
-	c.tasks[reqID] = task
-	c.tasksMu.Unlock()
+	c.setReqState(reqID, &wsReqState{
+		Task: task,
+		Route: wsLateReplyRoute{
+			ChatID:    actualChatID,
+			ChatType:  chatType,
+			ReadyAt:   time.Now().Add(wsStreamMaxDuration),
+			ExpiresAt: time.Now().Add(wsLateReplyRouteTTL),
+		},
+	})
 
 	logger.DebugCF("wecom_aibot", "Registered new agent task",
 		map[string]any{"chat_id": actualChatID, "req_id": reqID, "stream_id": streamID})
@@ -710,11 +762,7 @@ func (c *WeComAIBotWSChannel) dispatchWSAgentTask(
 	go func() {
 		defer func() {
 			taskCancel()
-			c.tasksMu.Lock()
-			if c.tasks[reqID] == task {
-				delete(c.tasks, reqID)
-			}
-			c.tasksMu.Unlock()
+			c.clearReqTask(reqID, task)
 		}()
 
 		sender := bus.SenderInfo{
@@ -760,6 +808,7 @@ func (c *WeComAIBotWSChannel) dispatchWSAgentTask(
 			case answer := <-task.answerCh:
 				// send final frame with finish=true; any media will come in subsequent frames (if at all)
 				c.wsSendStreamFinish(reqID, streamID, answer)
+				c.deleteReqState(reqID)
 				return
 			case <-ticker.C:
 				hint := waitHints[tickCount%len(waitHints)]
@@ -781,6 +830,7 @@ func (c *WeComAIBotWSChannel) dispatchWSAgentTask(
 				select {
 				case answer := <-task.answerCh:
 					c.wsSendStreamFinish(reqID, streamID, answer)
+					c.deleteReqState(reqID)
 				case <-time.After(100 * time.Millisecond):
 				}
 				return
@@ -851,6 +901,40 @@ func (c *WeComAIBotWSChannel) wsSendWelcomeMsg(reqID, content string) {
 	})
 }
 
+// wsSendActivePush sends a proactive markdown message using aibot_send_msg.
+// It is used as a fallback for late replies after stream response window expires.
+func (c *WeComAIBotWSChannel) wsSendActivePush(chatID string, chatType uint32, content string) error {
+	if chatID == "" {
+		return fmt.Errorf("chatid is empty")
+	}
+	reqID := wsGenerateID()
+
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("websocket not connected")
+	}
+
+	resp, err := c.sendAndWait(conn, reqID, wsCommand{
+		Cmd:     "aibot_send_msg",
+		Headers: wsHeaders{ReqID: reqID},
+		Body: wsSendMsgBody{
+			ChatID:   chatID,
+			ChatType: chatType,
+			MsgType:  "markdown",
+			Markdown: &wsMarkdownContent{Content: content},
+		},
+	}, wsSendMsgTimeout)
+	if err != nil {
+		return err
+	}
+	if resp.ErrCode != 0 {
+		return fmt.Errorf("aibot_send_msg rejected (errcode=%d): %s", resp.ErrCode, resp.ErrMsg)
+	}
+	return nil
+}
+
 // writeWS serializes cmd to JSON and writes it to the active WebSocket
 // connection.  It is safe to call from multiple goroutines.
 func (c *WeComAIBotWSChannel) writeWS(cmd any) {
@@ -877,12 +961,65 @@ func (c *WeComAIBotWSChannel) writeWS(cmd any) {
 
 // cancelAllTasks cancels every pending agent task; called when the connection drops.
 func (c *WeComAIBotWSChannel) cancelAllTasks() {
-	c.tasksMu.Lock()
-	defer c.tasksMu.Unlock()
-	for chatID, task := range c.tasks {
-		task.cancel()
-		delete(c.tasks, chatID)
+	c.reqStatesMu.Lock()
+	defer c.reqStatesMu.Unlock()
+	for _, state := range c.reqStates {
+		if state != nil && state.Task != nil {
+			state.Task.cancel()
+			state.Task = nil
+		}
 	}
+}
+
+func (c *WeComAIBotWSChannel) setReqState(reqID string, state *wsReqState) {
+	c.reqStatesMu.Lock()
+	defer c.reqStatesMu.Unlock()
+	now := time.Now()
+	for k, v := range c.reqStates {
+		if v == nil || now.After(v.Route.ExpiresAt) {
+			delete(c.reqStates, k)
+		}
+	}
+	c.reqStates[reqID] = state
+}
+
+func (c *WeComAIBotWSChannel) getReqState(reqID string) (*wsTask, wsLateReplyRoute, bool) {
+	c.reqStatesMu.Lock()
+	defer c.reqStatesMu.Unlock()
+	state, ok := c.reqStates[reqID]
+	if !ok || state == nil {
+		return nil, wsLateReplyRoute{}, false
+	}
+	if time.Now().After(state.Route.ExpiresAt) {
+		delete(c.reqStates, reqID)
+		return nil, wsLateReplyRoute{}, false
+	}
+	return state.Task, state.Route, true
+}
+
+func (c *WeComAIBotWSChannel) deleteReqState(reqID string) {
+	c.reqStatesMu.Lock()
+	delete(c.reqStates, reqID)
+	c.reqStatesMu.Unlock()
+}
+
+func (c *WeComAIBotWSChannel) clearReqTask(reqID string, task *wsTask) {
+	c.reqStatesMu.Lock()
+	defer c.reqStatesMu.Unlock()
+	state, ok := c.reqStates[reqID]
+	if !ok || state == nil {
+		return
+	}
+	if state.Task == task {
+		state.Task = nil
+	}
+}
+
+func wsChatTypeValue(chatType string) uint32 {
+	if chatType == "group" {
+		return 2
+	}
+	return 1
 }
 
 // wsGenerateID generates a random 10-character alphanumeric ID.
