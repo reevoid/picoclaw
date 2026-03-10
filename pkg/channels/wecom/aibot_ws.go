@@ -26,6 +26,12 @@ const (
 	wsSubscribeTimeout  = 10 * time.Second
 	wsMaxReconnectWait  = 60 * time.Second
 	wsInitialReconnect  = time.Second
+
+	// WeCom requires finish=true within 6 minutes of the first stream frame.
+	// wsStreamTickInterval controls how often we send an in-progress hint.
+	// wsStreamMaxDuration is a safety margin below the 6-minute hard limit.
+	wsStreamTickInterval = 30 * time.Second
+	wsStreamMaxDuration  = 5*time.Minute + 30*time.Second
 )
 
 // WeComAIBotWSChannel implements channels.Channel for WeCom AI Bot using the
@@ -605,15 +611,51 @@ func (c *WeComAIBotWSChannel) handleWSTextMessage(reqID string, msg WeComAIBotWS
 			"aibotid":   msg.AIBotID,
 			"stream_id": streamID,
 		}
+		// PublishInbound is non-blocking; the agent will call Send() when done.
 		c.HandleMessage(taskCtx, peer, msg.MsgID, userID, chatID,
 			msg.Text.Content, nil, metadata, sender)
 
-		// Wait for the agent reply and send it as the final stream frame.
-		select {
-		case answer := <-task.answerCh:
-			c.wsSendStreamFinish(reqID, streamID, answer)
-		case <-taskCtx.Done():
-			// Connection dropped or task canceled; nothing to send.
+		// Wait for the agent reply. While waiting, send periodic finish=false
+		// hints so the user knows processing is still in progress.
+		// WeCom requires finish=true within 6 minutes of the first stream frame;
+		// wsStreamMaxDuration enforces that limit with a safety margin.
+		waitHints := []string{
+			"⏳ Processing, please wait...",
+			"⏳ Still processing, please wait...",
+			"⏳ Almost there, please wait...",
+		}
+		ticker := time.NewTicker(wsStreamTickInterval)
+		defer ticker.Stop()
+		deadlineTimer := time.NewTimer(wsStreamMaxDuration)
+		defer deadlineTimer.Stop()
+		tickCount := 0
+		for {
+			select {
+			case answer := <-task.answerCh:
+				// Agent replied — deliver the real answer as the final frame.
+				c.wsSendStreamFinish(reqID, streamID, answer)
+				return
+			case <-ticker.C:
+				// Send an in-progress hint (finish=false). WeCom replaces the
+				// displayed content with the latest non-finish frame, so the
+				// user just sees the most recent hint, not an accumulation.
+				hint := waitHints[tickCount%len(waitHints)]
+				tickCount++
+				logger.DebugCF("wecom_aibot", "Sending stream progress hint",
+					map[string]any{"chat_id": chatID, "tick": tickCount})
+				c.wsSendStreamChunk(reqID, streamID, false, hint)
+			case <-deadlineTimer.C:
+				// Hard deadline reached before the agent replied. Close the
+				// stream with a timeout notice (still within the 6-minute window).
+				logger.WarnCF("wecom_aibot", "Stream deadline reached without agent reply",
+					map[string]any{"chat_id": chatID, "stream_id": streamID})
+				c.wsSendStreamFinish(reqID, streamID,
+					"⏳ Processing is taking longer than expected. Please resend your message to try again.")
+				return
+			case <-taskCtx.Done():
+				// Connection dropped or task canceled; nothing to send.
+				return
+			}
 		}
 	}()
 }
