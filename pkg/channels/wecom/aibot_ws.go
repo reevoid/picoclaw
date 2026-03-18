@@ -662,14 +662,15 @@ func (c *WeComAIBotWSChannel) handleWSImageMessage(reqID string, msg WeComAIBotW
 	ctx, cancel := context.WithTimeout(c.ctx, wsImageDownloadTimeout)
 	defer cancel()
 
-	var mediaRefs []string
+	mediaRefs := make([]string, 0, 1)
 	ref, err := c.storeWSImage(ctx, chatID, msg.MsgID, msg.Image.URL, msg.Image.AESKey)
 	if err != nil {
 		logger.WarnCF("wecom_aibot", "Failed to download/store WS image",
 			map[string]any{"error": err.Error(), "url": msg.Image.URL})
-	} else {
-		mediaRefs = append(mediaRefs, ref)
+		c.wsSendStreamFinish(reqID, wsGenerateID(), "Image message could not be processed.")
+		return
 	}
+	mediaRefs = append(mediaRefs, ref)
 
 	c.dispatchWSAgentTask(reqID, msg, "[image]", mediaRefs)
 }
