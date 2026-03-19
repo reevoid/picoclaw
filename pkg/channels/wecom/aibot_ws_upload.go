@@ -60,7 +60,7 @@ type wsUploadFinishBody struct {
 type wsUploadFinishResponse struct {
 	Type      string `json:"type"`
 	MediaID   string `json:"media_id"`
-	CreatedAt string `json:"created_at"`
+	CreatedAt int64  `json:"created_at"` // Unix timestamp (seconds)
 }
 
 // ---- Public API ----

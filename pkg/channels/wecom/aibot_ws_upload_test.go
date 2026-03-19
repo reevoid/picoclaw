@@ -237,7 +237,7 @@ func TestWsUploadChunkBodyBase64(t *testing.T) {
 // TestWsUploadFinishResponseJSON checks that the finish response unmarshals
 // the fields WeCom returns.
 func TestWsUploadFinishResponseJSON(t *testing.T) {
-	raw := `{"type":"file","media_id":"MEDIAID_ABCDE","created_at":"1680000000"}`
+	raw := `{"type":"file","media_id":"MEDIAID_ABCDE","created_at":1680000000}`
 	var resp wsUploadFinishResponse
 	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -248,8 +248,8 @@ func TestWsUploadFinishResponseJSON(t *testing.T) {
 	if resp.Type != "file" {
 		t.Errorf("type: got %q, want %q", resp.Type, "file")
 	}
-	if resp.CreatedAt != "1680000000" {
-		t.Errorf("created_at: got %q, want %q", resp.CreatedAt, "1680000000")
+	if resp.CreatedAt != 1680000000 {
+		t.Errorf("created_at: got %d, want %d", resp.CreatedAt, int64(1680000000))
 	}
 }
 
