@@ -48,6 +48,11 @@ const (
 
 	// Keep req_id -> chat route for late fallback pushes after stream window closes.
 	wsLateReplyRouteTTL = 30 * time.Minute
+
+	// wsStreamMaxContentBytes is the maximum UTF-8 byte length for the content field
+	// of a single WeCom AI Bot stream / text / markdown frame.
+	// Ref: https://developer.work.weixin.qq.com/document/path/101463
+	wsStreamMaxContentBytes = 20480
 )
 
 // wsImageHTTPClient is a shared HTTP client for downloading inbound images.
@@ -865,8 +870,12 @@ func (c *WeComAIBotWSChannel) dispatchWSAgentTask(
 		for {
 			select {
 			case answer := <-task.answerCh:
-				// send final frame with finish=true; any media will come in subsequent frames (if at all)
-				c.wsSendStreamFinish(reqID, streamID, answer)
+				// Split the answer into byte-bounded chunks and send as stream frames.
+				// All but the last carry finish=false; the final frame closes the stream.
+				chunks := splitWSContent(answer, wsStreamMaxContentBytes)
+				for i, chunk := range chunks {
+					c.wsSendStreamChunk(reqID, streamID, i == len(chunks)-1, chunk)
+				}
 				c.deleteReqState(reqID)
 				return
 			case <-ticker.C:
@@ -994,22 +1003,29 @@ func (c *WeComAIBotWSChannel) wsSendWelcomeMsg(reqID, content string) {
 }
 
 // wsSendActivePush sends a proactive markdown message using aibot_send_msg.
+// Long content is automatically split into byte-bounded chunks (≤ wsStreamMaxContentBytes
+// each) and delivered as consecutive messages.
 // It is used as a fallback for late replies after stream response window expires.
 func (c *WeComAIBotWSChannel) wsSendActivePush(chatID string, chatType uint32, content string) error {
 	if chatID == "" {
 		return fmt.Errorf("chatid is empty")
 	}
-	reqID := wsGenerateID()
-	return c.writeWSAndWait(wsCommand{
-		Cmd:     "aibot_send_msg",
-		Headers: wsHeaders{ReqID: reqID},
-		Body: wsSendMsgBody{
-			ChatID:   chatID,
-			ChatType: chatType,
-			MsgType:  "markdown",
-			Markdown: &wsMarkdownContent{Content: content},
-		},
-	}, wsSendMsgTimeout)
+	for _, chunk := range splitWSContent(content, wsStreamMaxContentBytes) {
+		reqID := wsGenerateID()
+		if err := c.writeWSAndWait(wsCommand{
+			Cmd:     "aibot_send_msg",
+			Headers: wsHeaders{ReqID: reqID},
+			Body: wsSendMsgBody{
+				ChatID:   chatID,
+				ChatType: chatType,
+				MsgType:  "markdown",
+				Markdown: &wsMarkdownContent{Content: chunk},
+			},
+		}, wsSendMsgTimeout); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeWSAndWait writes cmd to the active connection and validates the command response.
@@ -1279,4 +1295,53 @@ func wsLabelToDefaultExt(label string) string {
 	default: // "file" and any future labels
 		return ".bin"
 	}
+}
+
+// ---- Content length helpers ----
+
+// splitWSContent splits content into chunks each fitting within maxBytes UTF-8
+// bytes, preserving code block integrity via channels.SplitMessage.
+// When SplitMessage still produces an oversized chunk (e.g. dense CJK content),
+// splitAtByteBoundary is applied as a last-resort byte-level fallback.
+func splitWSContent(content string, maxBytes int) []string {
+	if len(content) <= maxBytes {
+		return []string{content}
+	}
+	// SplitMessage works in runes. Use maxBytes as the rune limit: for pure ASCII
+	// this is exact; for multibyte content the byte verification below catches
+	// any chunk that still overflows.
+	chunks := channels.SplitMessage(content, maxBytes)
+	var result []string
+	for _, chunk := range chunks {
+		if len(chunk) <= maxBytes {
+			result = append(result, chunk)
+		} else {
+			// Still too large in bytes (e.g. dense CJK); force-split at UTF-8 boundaries.
+			result = append(result, splitAtByteBoundary(chunk, maxBytes)...)
+		}
+	}
+	return result
+}
+
+// splitAtByteBoundary splits s into parts each ≤ maxBytes bytes by walking back
+// from the hard byte limit to find a valid UTF-8 rune start boundary.
+// This is a last-resort fallback; it does not try to preserve code blocks.
+func splitAtByteBoundary(s string, maxBytes int) []string {
+	var parts []string
+	for len(s) > maxBytes {
+		end := maxBytes
+		// Walk back past any UTF-8 continuation bytes (high two bits == 10).
+		for end > 0 && s[end]>>6 == 0b10 {
+			end--
+		}
+		if end == 0 {
+			end = maxBytes // shouldn't happen with valid UTF-8
+		}
+		parts = append(parts, s[:end])
+		s = strings.TrimLeft(s[end:], " \t\n\r")
+	}
+	if s != "" {
+		parts = append(parts, s)
+	}
+	return parts
 }

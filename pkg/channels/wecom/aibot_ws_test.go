@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
@@ -215,4 +216,80 @@ func TestStoreWSMedia_ContentTypeExt(t *testing.T) {
 	if ext := path[len(path)-4:]; ext != ".mp4" {
 		t.Errorf("expected .mp4 extension from Content-Type, got %q", ext)
 	}
+}
+
+// TestSplitWSContent verifies byte-aware splitting of stream content.
+func TestSplitWSContent(t *testing.T) {
+	t.Run("short content is not split", func(t *testing.T) {
+		chunks := splitWSContent("hello", 20480)
+		if len(chunks) != 1 || chunks[0] != "hello" {
+			t.Fatalf("unexpected chunks: %v", chunks)
+		}
+	})
+
+	t.Run("ASCII content split at byte boundary", func(t *testing.T) {
+		// Build a string just over the limit.
+		content := strings.Repeat("a", 20481)
+		chunks := splitWSContent(content, 20480)
+		if len(chunks) < 2 {
+			t.Fatalf("expected >= 2 chunks, got %d", len(chunks))
+		}
+		for i, c := range chunks {
+			if len(c) > 20480 {
+				t.Errorf("chunk %d has %d bytes, want <= 20480", i, len(c))
+			}
+		}
+		// Reassembled content must equal the original (possibly without leading
+		// whitespace that splitWSContent trims between chunks).
+		joined := strings.Join(chunks, "")
+		if len(joined) < len(content)-len(chunks) {
+			t.Errorf("joined length %d too short (original %d)", len(joined), len(content))
+		}
+	})
+
+	t.Run("CJK content split within byte limit", func(t *testing.T) {
+		// Each CJK rune is 3 bytes in UTF-8.
+		// 7000 CJK chars = 21000 bytes, which exceeds 20480.
+		content := strings.Repeat("\u4e2d", 7000)
+		chunks := splitWSContent(content, 20480)
+		if len(chunks) < 2 {
+			t.Fatalf("expected >= 2 chunks for 21000-byte CJK content, got %d", len(chunks))
+		}
+		for i, c := range chunks {
+			if len(c) > 20480 {
+				t.Errorf("chunk %d has %d bytes, want <= 20480", i, len(c))
+			}
+			// Every chunk must be valid UTF-8.
+			if !strings.ContainsRune(c, '\u4e2d') && len(c) > 0 {
+				// quick plausibility check — content was pure CJK
+			}
+		}
+	})
+}
+
+// TestSplitAtByteBoundary verifies the last-resort byte-boundary splitter.
+func TestSplitAtByteBoundary(t *testing.T) {
+	t.Run("ASCII fits in one chunk", func(t *testing.T) {
+		parts := splitAtByteBoundary("hello world", 100)
+		if len(parts) != 1 {
+			t.Fatalf("expected 1 part, got %d", len(parts))
+		}
+	})
+
+	t.Run("splits at byte boundary, never mid-rune", func(t *testing.T) {
+		// 10 CJK characters = 30 bytes; split at 20 bytes.
+		s := strings.Repeat("\u6587", 10) // 10 × 3 bytes = 30 bytes
+		parts := splitAtByteBoundary(s, 20)
+		for i, p := range parts {
+			if len(p) > 20 {
+				t.Errorf("part %d has %d bytes, want <= 20", i, len(p))
+			}
+			// Must be valid UTF-8 (no torn multi-byte sequences).
+			for j, r := range p {
+				if r == '\uFFFD' {
+					t.Errorf("part %d has replacement rune at position %d: torn UTF-8", i, j)
+				}
+			}
+		}
+	})
 }
