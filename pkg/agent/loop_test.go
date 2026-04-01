@@ -670,7 +670,12 @@ func TestProcessMessage_MediaToolHandledSkipsFollowUpLLMAndFinalText(t *testing.
 	if err != nil {
 		t.Fatalf("resolveMessageRoute() error = %v", err)
 	}
-	sessionKey := resolveScopeKey(route, "")
+	sessionKey := resolveScopeKey(al.allocateRouteSession(route, bus.InboundMessage{
+		Channel:  "telegram",
+		ChatID:   "chat1",
+		SenderID: "user1",
+		Content:  "take a screenshot of the screen and send it to me",
+	}).SessionKey, "")
 	history := defaultAgent.Sessions.GetHistory(sessionKey)
 	if len(history) == 0 {
 		t.Fatal("expected session history to be saved")
@@ -1492,7 +1497,7 @@ func TestProcessMessage_UsesRouteSessionKey(t *testing.T) {
 		Channel: msg.Channel,
 		Peer:    extractPeer(msg),
 	})
-	sessionKey := route.SessionKey
+	sessionKey := al.allocateRouteSession(route, msg).SessionKey
 
 	defaultAgent := al.registry.GetDefaultAgent()
 	if defaultAgent == nil {
@@ -2195,7 +2200,15 @@ func TestAgentLoop_ToolLimitUsesDedicatedFallback(t *testing.T) {
 			ID:   "cron",
 		},
 	})
-	history := defaultAgent.Sessions.GetHistory(route.SessionKey)
+	history := defaultAgent.Sessions.GetHistory(al.allocateRouteSession(route, bus.InboundMessage{
+		Channel:  "test",
+		SenderID: "cron",
+		ChatID:   "chat1",
+		Peer: bus.Peer{
+			Kind: "direct",
+			ID:   "cron",
+		},
+	}).SessionKey)
 	if len(history) != 4 {
 		t.Fatalf("history len = %d, want 4", len(history))
 	}

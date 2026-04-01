@@ -27,6 +27,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/routing"
+	"github.com/sipeed/picoclaw/pkg/session"
 	"github.com/sipeed/picoclaw/pkg/skills"
 	"github.com/sipeed/picoclaw/pkg/state"
 	"github.com/sipeed/picoclaw/pkg/tools"
@@ -672,9 +673,10 @@ func (al *AgentLoop) buildContinuationTarget(msg bus.InboundMessage) (*continuat
 	if err != nil {
 		return nil, err
 	}
+	allocation := al.allocateRouteSession(route, msg)
 
 	return &continuationTarget{
-		SessionKey: resolveScopeKey(route, msg.SessionKey),
+		SessionKey: resolveScopeKey(allocation.SessionKey, msg.SessionKey),
 		Channel:    msg.Channel,
 		ChatID:     msg.ChatID,
 	}, nil
@@ -1323,18 +1325,22 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		}
 	}
 
-	// Resolve session key from route, while preserving explicit agent-scoped keys.
-	scopeKey := resolveScopeKey(route, msg.SessionKey)
+	allocation := al.allocateRouteSession(route, msg)
+
+	// Resolve session key from the route allocation, while preserving explicit
+	// agent-scoped keys supplied by the caller.
+	scopeKey := resolveScopeKey(allocation.SessionKey, msg.SessionKey)
 	sessionKey := scopeKey
 
 	logger.InfoCF("agent", "Routed message",
 		map[string]any{
-			"agent_id":      agent.ID,
-			"scope_key":     scopeKey,
-			"session_key":   sessionKey,
-			"matched_by":    route.MatchedBy,
-			"route_agent":   route.AgentID,
-			"route_channel": route.Channel,
+			"agent_id":           agent.ID,
+			"scope_key":          scopeKey,
+			"session_key":        sessionKey,
+			"matched_by":         route.MatchedBy,
+			"route_agent":        route.AgentID,
+			"route_channel":      route.Channel,
+			"route_main_session": allocation.MainSessionKey,
 		})
 
 	opts := processOptions{
@@ -1401,11 +1407,21 @@ func normalizedInboundContext(msg bus.InboundMessage) bus.InboundContext {
 	return bus.NormalizeInboundMessage(msg).Context
 }
 
-func resolveScopeKey(route routing.ResolvedRoute, msgSessionKey string) string {
+func resolveScopeKey(routeSessionKey, msgSessionKey string) string {
 	if msgSessionKey != "" && strings.HasPrefix(msgSessionKey, sessionKeyAgentPrefix) {
 		return msgSessionKey
 	}
-	return route.SessionKey
+	return routeSessionKey
+}
+
+func (al *AgentLoop) allocateRouteSession(route routing.ResolvedRoute, msg bus.InboundMessage) session.Allocation {
+	return session.AllocateRouteSession(session.AllocationInput{
+		AgentID:       route.AgentID,
+		Channel:       route.Channel,
+		AccountID:     route.AccountID,
+		Peer:          extractPeer(msg),
+		SessionPolicy: route.SessionPolicy,
+	})
 }
 
 func (al *AgentLoop) resolveSteeringTarget(msg bus.InboundMessage) (string, string, bool) {
@@ -1417,8 +1433,9 @@ func (al *AgentLoop) resolveSteeringTarget(msg bus.InboundMessage) (string, stri
 	if err != nil || agent == nil {
 		return "", "", false
 	}
+	allocation := al.allocateRouteSession(route, msg)
 
-	return resolveScopeKey(route, msg.SessionKey), agent.ID, true
+	return resolveScopeKey(allocation.SessionKey, msg.SessionKey), agent.ID, true
 }
 
 func (al *AgentLoop) requeueInboundMessage(msg bus.InboundMessage) error {

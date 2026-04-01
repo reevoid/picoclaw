@@ -16,14 +16,21 @@ type RouteInput struct {
 	TeamID     string
 }
 
+// SessionPolicy describes how a routed message should be mapped to a session.
+// The current implementation preserves the legacy dm_scope and identity_link
+// semantics while moving session-key construction out of the router.
+type SessionPolicy struct {
+	DMScope       DMScope
+	IdentityLinks map[string][]string
+}
+
 // ResolvedRoute is the result of agent routing.
 type ResolvedRoute struct {
-	AgentID        string
-	Channel        string
-	AccountID      string
-	SessionKey     string
-	MainSessionKey string
-	MatchedBy      string // "binding.peer", "binding.peer.parent", "binding.guild", "binding.team", "binding.account", "binding.channel", "default"
+	AgentID       string
+	Channel       string
+	AccountID     string
+	SessionPolicy SessionPolicy
+	MatchedBy     string // "binding.peer", "binding.peer.parent", "binding.guild", "binding.team", "binding.account", "binding.channel", "default"
 }
 
 // RouteResolver determines which agent handles a message based on config bindings.
@@ -36,7 +43,8 @@ func NewRouteResolver(cfg *config.Config) *RouteResolver {
 	return &RouteResolver{cfg: cfg}
 }
 
-// ResolveRoute determines which agent handles the message and constructs session keys.
+// ResolveRoute determines which agent handles the message and returns the
+// session policy that should be used to allocate session state.
 // Implements the 7-level priority cascade:
 // peer > parent_peer > guild > team > account > channel_wildcard > default
 func (r *RouteResolver) ResolveRoute(input RouteInput) ResolvedRoute {
@@ -44,32 +52,18 @@ func (r *RouteResolver) ResolveRoute(input RouteInput) ResolvedRoute {
 	accountID := NormalizeAccountID(input.AccountID)
 	peer := input.Peer
 
-	dmScope := DMScope(r.cfg.Session.DMScope)
-	if dmScope == "" {
-		dmScope = DMScopeMain
-	}
-	identityLinks := r.cfg.Session.IdentityLinks
+	sessionPolicy := r.sessionPolicy()
 
 	bindings := r.filterBindings(channel, accountID)
 
 	choose := func(agentID string, matchedBy string) ResolvedRoute {
 		resolvedAgentID := r.pickAgentID(agentID)
-		sessionKey := strings.ToLower(BuildAgentPeerSessionKey(SessionKeyParams{
+		return ResolvedRoute{
 			AgentID:       resolvedAgentID,
 			Channel:       channel,
 			AccountID:     accountID,
-			Peer:          peer,
-			DMScope:       dmScope,
-			IdentityLinks: identityLinks,
-		}))
-		mainSessionKey := strings.ToLower(BuildAgentMainSessionKey(resolvedAgentID))
-		return ResolvedRoute{
-			AgentID:        resolvedAgentID,
-			Channel:        channel,
-			AccountID:      accountID,
-			SessionKey:     sessionKey,
-			MainSessionKey: mainSessionKey,
-			MatchedBy:      matchedBy,
+			SessionPolicy: sessionPolicy,
+			MatchedBy:     matchedBy,
 		}
 	}
 
@@ -249,4 +243,28 @@ func (r *RouteResolver) resolveDefaultAgentID() string {
 		return NormalizeAgentID(id)
 	}
 	return DefaultAgentID
+}
+
+func (r *RouteResolver) sessionPolicy() SessionPolicy {
+	dmScope := DMScope(r.cfg.Session.DMScope)
+	if dmScope == "" {
+		dmScope = DMScopeMain
+	}
+	return SessionPolicy{
+		DMScope:       dmScope,
+		IdentityLinks: cloneIdentityLinks(r.cfg.Session.IdentityLinks),
+	}
+}
+
+func cloneIdentityLinks(src map[string][]string) map[string][]string {
+	if len(src) == 0 {
+		return nil
+	}
+	cloned := make(map[string][]string, len(src))
+	for canonical, ids := range src {
+		dup := make([]string, len(ids))
+		copy(dup, ids)
+		cloned[canonical] = dup
+	}
+	return cloned
 }

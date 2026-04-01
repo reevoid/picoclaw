@@ -37,6 +37,12 @@ func TestResolveRoute_DefaultAgent_NoBindings(t *testing.T) {
 	if route.MatchedBy != "default" {
 		t.Errorf("MatchedBy = %q, want 'default'", route.MatchedBy)
 	}
+	if route.SessionPolicy.DMScope != DMScopePerPeer {
+		t.Errorf("SessionPolicy.DMScope = %q, want %q", route.SessionPolicy.DMScope, DMScopePerPeer)
+	}
+	if route.SessionPolicy.IdentityLinks != nil {
+		t.Errorf("SessionPolicy.IdentityLinks = %v, want nil", route.SessionPolicy.IdentityLinks)
+	}
 }
 
 func TestResolveRoute_PeerBinding(t *testing.T) {
