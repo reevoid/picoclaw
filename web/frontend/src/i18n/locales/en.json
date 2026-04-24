@@ -60,6 +60,7 @@
       "step4": "Almost there..."
     },
     "reasoningLabel": "Reasoning",
+    "showThoughts": "Show reasoning",
     "toolLabel": "Tool",
     "history": "History",
     "noHistory": "No chat history yet",
