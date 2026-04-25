@@ -13,7 +13,23 @@ export interface ChatAttachment {
   contentType?: string
 }
 
-export type AssistantMessageKind = "normal" | "thought"
+export interface ChatToolCallFunction {
+  name?: string
+  arguments?: string
+}
+
+export interface ChatToolCallExtraContent {
+  toolFeedbackExplanation?: string
+}
+
+export interface ChatToolCall {
+  id?: string
+  type?: string
+  function?: ChatToolCallFunction
+  extraContent?: ChatToolCallExtraContent
+}
+
+export type AssistantMessageKind = "normal" | "thought" | "tool_calls"
 
 export interface ChatMessage {
   id: string
@@ -22,6 +38,7 @@ export interface ChatMessage {
   timestamp: number | string
   kind?: AssistantMessageKind
   attachments?: ChatAttachment[]
+  toolCalls?: ChatToolCall[]
 }
 
 export interface ContextUsage {

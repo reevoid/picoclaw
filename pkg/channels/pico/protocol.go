@@ -19,10 +19,13 @@ const (
 	TypeError         = "error"
 	TypePong          = "pong"
 
-	PayloadKeyContent = "content"
-	PayloadKeyThought = "thought"
+	PayloadKeyContent   = "content"
+	PayloadKeyThought   = "thought"
+	PayloadKeyKind      = "kind"
+	PayloadKeyToolCalls = "tool_calls"
 
-	MessageKindThought = "thought"
+	MessageKindThought   = "thought"
+	MessageKindToolCalls = "tool_calls"
 )
 
 // PicoMessage is the wire format for all Pico Protocol messages.

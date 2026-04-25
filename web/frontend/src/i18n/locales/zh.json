@@ -60,6 +60,9 @@
       "step4": "马上就好..."
     },
     "reasoningLabel": "思考",
+    "toolCallsLabel": "工具调用",
+    "toolCallExplanationLabel": "调用提示",
+    "toolCallFunctionLabel": "调用摘要",
     "showThoughts": "展示思考过程",
     "toolLabel": "工具",
     "history": "历史记录",

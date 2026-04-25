@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/constants"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
@@ -383,7 +382,11 @@ func (p *Pipeline) CallLLM(
 	}
 
 	reasoningContent := responseReasoningContent(exec.response)
-	if ts.channel == "pico" {
+	shouldPublishPicoToolCallInterim := ts.channel == "pico" && len(exec.response.ToolCalls) > 0
+	if shouldPublishPicoToolCallInterim {
+		// Pico tool-call turns publish their reasoning/content/tool summary as a
+		// structured sequence after the tool-call payload is normalized below.
+	} else if ts.channel == "pico" {
 		go al.publishPicoReasoning(turnCtx, reasoningContent, ts.chatID)
 	} else {
 		go al.handleReasoning(
@@ -418,30 +421,6 @@ func (p *Pipeline) CallLLM(
 		llmResponseFields["total_tokens"] = exec.response.Usage.TotalTokens
 	}
 	logger.DebugCF("agent", "LLM response", llmResponseFields)
-
-	if al.bus != nil &&
-		ts.channel == "pico" &&
-		len(exec.response.ToolCalls) > 0 &&
-		ts.opts.AllowInterimPicoPublish &&
-		!shouldPublishToolFeedback(al.cfg, ts) {
-		if strings.TrimSpace(exec.response.Content) != "" {
-			outCtx, outCancel := context.WithTimeout(turnCtx, 3*time.Second)
-			publishErr := al.bus.PublishOutbound(outCtx, bus.OutboundMessage{
-				Channel: ts.channel,
-				ChatID:  ts.chatID,
-				Content: exec.response.Content,
-			})
-			outCancel()
-			if publishErr != nil {
-				logger.WarnCF("agent", "Failed to publish pico interim tool-call content", map[string]any{
-					"error":     publishErr.Error(),
-					"channel":   ts.channel,
-					"chat_id":   ts.chatID,
-					"iteration": iteration,
-				})
-			}
-		}
-	}
 
 	// No-tool-call path: steering check and direct response
 	if len(exec.response.ToolCalls) == 0 || exec.gracefulTerminal {
@@ -530,6 +509,15 @@ func (p *Pipeline) CallLLM(
 		ts.agent.Sessions.AddFullMessage(ts.sessionKey, assistantMsg)
 		ts.recordPersistedMessage(assistantMsg)
 		ts.ingestMessage(turnCtx, al, assistantMsg)
+	}
+	if shouldPublishPicoToolCallInterim {
+		al.publishPicoToolCallInterim(
+			turnCtx,
+			ts,
+			reasoningContent,
+			exec.response.Content,
+			assistantMsg.ToolCalls,
+		)
 	}
 
 	return ControlToolLoop, nil

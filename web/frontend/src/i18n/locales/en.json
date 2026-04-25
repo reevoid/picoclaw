@@ -60,6 +60,9 @@
       "step4": "Almost there..."
     },
     "reasoningLabel": "Reasoning",
+    "toolCallsLabel": "Tool calls",
+    "toolCallExplanationLabel": "Call note",
+    "toolCallFunctionLabel": "Call summary",
     "showThoughts": "Show reasoning",
     "toolLabel": "Tool",
     "history": "History",

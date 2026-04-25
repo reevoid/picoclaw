@@ -269,7 +269,7 @@ export function ChatPage() {
           )
         }
       >
-        <div className="hidden items-center gap-2 rounded-lg border border-border/60 px-3 py-1.5 sm:flex">
+        <div className="border-border/60 hidden items-center gap-2 rounded-lg border px-3 py-1.5 sm:flex">
           <span className="text-muted-foreground text-sm">
             {t("chat.showThoughts")}
           </span>
@@ -333,7 +333,8 @@ export function ChatPage() {
                   <AssistantMessage
                     content={msg.content}
                     attachments={msg.attachments}
-                    isThought={msg.kind === "thought"}
+                    kind={msg.kind}
+                    toolCalls={msg.toolCalls}
                     timestamp={msg.timestamp}
                   />
                 ) : (
